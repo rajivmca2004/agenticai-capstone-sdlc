@@ -1,30 +1,30 @@
 # Copyright (c) Microsoft. All rights reserved.
 """
-Agents Package Initialization
+Agents package - LangGraph nodes for code comprehension workflow.
 
-This package contains the A2A-compliant agent implementations:
-- Code Ingestion Agent: Ingest code from GitHub and prepare it for downstream analysis
-- Architect Agent: Generate business + technical comprehension reports
+This package provides:
+- code_ingestion_node: Ingests GitHub repos and produces RepoBundle
+- architect_node: Analyzes repos and produces comprehension reports
 """
 
-from .code_ingestion_agent import (
-    CodeIngestionRequestHandler,
-    create_agent_card as create_code_ingestion_agent_card,
-    CODE_INGESTION_SYSTEM_PROMPT,
-)
-from .architect_agent import (
-    ArchitectRequestHandler,
-    create_agent_card as create_architect_agent_card,
+from .architect_node import (
     ARCHITECT_SYSTEM_PROMPT,
+    architect_node,
+    architect_node_sync,
+)
+from .code_ingestion_node import (
+    CODE_INGESTION_SYSTEM_PROMPT,
+    code_ingestion_node,
+    code_ingestion_node_sync,
 )
 
 __all__ = [
     # Code Ingestion Agent
-    "CodeIngestionRequestHandler",
-    "create_code_ingestion_agent_card",
     "CODE_INGESTION_SYSTEM_PROMPT",
+    "code_ingestion_node",
+    "code_ingestion_node_sync",
     # Architect Agent
-    "ArchitectRequestHandler",
-    "create_architect_agent_card",
     "ARCHITECT_SYSTEM_PROMPT",
+    "architect_node",
+    "architect_node_sync",
 ]
