@@ -430,6 +430,10 @@ agenticai-capstone-sdlc/
 │   ├── agents/
 │   │   ├── code_ingestion_node.py
 │   │   └── architect_node.py
+│   ├── observability/            # NEW: Logging & Metrics
+│   │   ├── __init__.py
+│   │   ├── logging.py            # Structured logging
+│   │   └── exceptions.py         # Custom exceptions
 │   ├── schemas/
 │   │   └── state.py              # Pydantic state models
 │   └── services/
@@ -438,6 +442,114 @@ agenticai-capstone-sdlc/
 ├── .env.example
 ├── start_api.ps1                 # API startup script
 └── README.md
+```
+
+---
+
+## 📊 Observability & Logging
+
+### Structured Logging
+
+The application uses **structlog** for structured JSON logging with:
+- Correlation IDs for request tracing
+- Performance tracking
+- Contextual logging
+- Multiple output formats (JSON for production, console for development)
+
+### Configuration
+
+Set in `.env`:
+
+```env
+# Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+LOG_LEVEL=INFO
+
+# Log format: json (production) or console (development)
+LOG_FORMAT=json
+
+# Optional: Log to file
+LOG_FILE=logs/app.log
+```
+
+### Correlation IDs
+
+Every API request includes a correlation ID for tracing:
+
+```bash
+# Pass your own correlation ID
+curl -H "X-Correlation-ID: my-trace-123" http://localhost:8000/analyze/...
+
+# Or let the API generate one - returned in response headers
+# X-Correlation-ID: 550e8400-e29b-41d4-a716-446655440000
+```
+
+### Log Output Example (JSON)
+
+```json
+{
+  "timestamp": "2025-12-25T10:30:00.000Z",
+  "level": "info",
+  "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "service": "code-comprehension",
+  "version": "0.2.0",
+  "event": "operation_completed",
+  "operation": "code_ingestion",
+  "duration_ms": 2345.67,
+  "files_processed": 245
+}
+```
+
+### Metrics Endpoint
+
+View application metrics:
+
+```bash
+curl http://localhost:8000/metrics
+```
+
+Response:
+```json
+{
+  "counters": {
+    "api_requests[method=POST,path=/analyze,status=200]": 15,
+    "jobs_completed[status=success]": 12,
+    "jobs_completed[status=failed]": 3
+  },
+  "gauges": {
+    "files_processed": 1234
+  },
+  "histograms": {
+    "api_request_duration_ms[path=/analyze]": [234.5, 456.7, ...]
+  }
+}
+```
+
+### Exception Handling
+
+The application uses domain-specific exceptions for better error handling:
+
+| Exception | Error Code | Description |
+|-----------|------------|-------------|
+| `RepositoryNotFoundError` | `REPO_NOT_FOUND` | GitHub repo doesn't exist |
+| `RepositoryAccessDeniedError` | `REPO_ACCESS_DENIED` | No permission to access repo |
+| `GitHubRateLimitError` | `GITHUB_RATE_LIMIT` | GitHub API rate limit exceeded |
+| `MissingAPIKeyError` | `CONFIG_ERROR` | Required API key not configured |
+| `LLMError` | `LLM_ERROR` | LLM provider error |
+| `JobNotFoundError` | `JOB_NOT_FOUND` | Analysis job doesn't exist |
+
+### Error Response Format
+
+All errors include correlation IDs for debugging:
+
+```json
+{
+  "error": "REPO_NOT_FOUND",
+  "message": "Repository not found: https://github.com/owner/nonexistent",
+  "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "details": {
+    "repo_url": "https://github.com/owner/nonexistent"
+  }
+}
 ```
 
 ---

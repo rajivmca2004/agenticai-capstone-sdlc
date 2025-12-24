@@ -16,7 +16,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from src.agents import architect_node, code_ingestion_node
+from src.observability import get_logger, LogContext, metrics
 from src.schemas import AgentState, IngestionStatus
+
+# Initialize logger
+logger = get_logger(__name__)
 
 
 # =============================================================================
@@ -32,7 +36,9 @@ def should_continue_to_architect(state: AgentState) -> Literal["architect", "end
         "end" if ingestion failed
     """
     if state.ingestion_status == IngestionStatus.COMPLETED and state.repo_bundle:
+        logger.info("routing_to_architect", reason="ingestion_completed")
         return "architect"
+    logger.info("routing_to_end", reason="ingestion_failed_or_incomplete")
     return "end"
 
 
@@ -42,6 +48,7 @@ def check_completion(state: AgentState) -> Literal["end"]:
     
     Always ends - this is the terminal node.
     """
+    logger.info("workflow_completing")
     return "end"
 
 
@@ -70,12 +77,16 @@ def create_comprehension_graph(
     Returns:
         Compiled StateGraph ready for execution
     """
+    logger.info("creating_comprehension_graph", debug=debug)
+    
     # Create the graph with our state schema
     workflow = StateGraph(AgentState)
     
     # Add nodes
     workflow.add_node("code_ingestion", code_ingestion_node)
     workflow.add_node("architect", architect_node)
+    
+    logger.debug("nodes_added", nodes=["code_ingestion", "architect"])
     
     # Add edges
     # Start → Code Ingestion
@@ -97,9 +108,13 @@ def create_comprehension_graph(
     # Use memory saver if no checkpointer provided (for development)
     if checkpointer is None:
         checkpointer = MemorySaver()
+        logger.debug("using_memory_saver")
     
     # Compile the graph
-    return workflow.compile(checkpointer=checkpointer)
+    compiled = workflow.compile(checkpointer=checkpointer)
+    logger.info("graph_compiled")
+    
+    return compiled
 
 
 # =============================================================================
@@ -164,27 +179,36 @@ async def run_comprehension_workflow(
     """
     from src.schemas import BusinessContext, TargetArchitecture
     
-    # Create initial state
-    initial_state = AgentState(
-        repo_url=repo_url,
-        ref=ref,
-        business_context=BusinessContext(
-            objective=business_objective or "Modernize application",
-        ) if business_objective else None,
-        target_architecture=TargetArchitecture(
-            platforms=target_platforms or ["Azure"],
-        ) if target_platforms else None,
-    )
-    
-    # Create and run graph
-    graph = create_comprehension_graph()
-    
-    # Run with thread ID for checkpointing
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    result = await graph.ainvoke(initial_state, config)
-    
-    return result
+    with LogContext(repo_url=repo_url, ref=ref, thread_id=thread_id):
+        logger.info("workflow_started")
+        
+        # Create initial state
+        initial_state = AgentState(
+            repo_url=repo_url,
+            ref=ref,
+            business_context=BusinessContext(
+                objective=business_objective or "Modernize application",
+            ) if business_objective else None,
+            target_architecture=TargetArchitecture(
+                platforms=target_platforms or ["Azure"],
+            ) if target_platforms else None,
+        )
+        
+        # Create and run graph
+        graph = create_comprehension_graph()
+        
+        # Run with thread ID for checkpointing
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        try:
+            result = await graph.ainvoke(initial_state, config)
+            logger.info("workflow_completed")
+            metrics.increment("workflows_completed", tags={"status": "success"})
+            return result
+        except Exception as e:
+            logger.exception("workflow_failed")
+            metrics.increment("workflows_completed", tags={"status": "failed"})
+            raise
 
 
 def run_comprehension_workflow_sync(

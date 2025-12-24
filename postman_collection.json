@@ -1,0 +1,278 @@
+{
+  "info": {
+    "name": "Code Comprehension API",
+    "description": "API collection for the Code Comprehension Agentic AI Solution",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "job_id",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            },
+            "description": "Check if the API server is healthy"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Analysis",
+      "item": [
+        {
+          "name": "Start Async Analysis",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.job_id) {",
+                  "    pm.collectionVariables.set('job_id', jsonData.job_id);",
+                  "    console.log('Job ID saved: ' + jsonData.job_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"repo_url\": \"https://github.com/microsoft/TypeScript\",\n    \"ref\": \"main\",\n    \"business_objective\": \"Evaluate for modernization\",\n    \"constraints\": [\"Budget < $500k\", \"6-month timeline\"],\n    \"kpis\": [\"Reduce MTTR by 50%\", \"99.9% uptime\"],\n    \"compliance\": [\"SOC2\", \"GDPR\"],\n    \"target_platforms\": [\"Azure AKS\", \"Azure SQL MI\"],\n    \"target_patterns\": [\"Microservices\", \"Event-Driven\"],\n    \"include_tests\": true,\n    \"max_file_mb\": 2.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/analyze",
+              "host": ["{{base_url}}"],
+              "path": ["analyze"]
+            },
+            "description": "Start an asynchronous repository analysis. Returns a job_id to track progress."
+          },
+          "response": []
+        },
+        {
+          "name": "Start Simple Analysis",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.job_id) {",
+                  "    pm.collectionVariables.set('job_id', jsonData.job_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"repo_url\": \"https://github.com/fastapi/fastapi\",\n    \"ref\": \"master\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/analyze",
+              "host": ["{{base_url}}"],
+              "path": ["analyze"]
+            },
+            "description": "Start analysis with minimal parameters"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Job Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/analyze/{{job_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["analyze", "{{job_id}}"]
+            },
+            "description": "Get the status and results of an analysis job"
+          },
+          "response": []
+        },
+        {
+          "name": "Sync Analysis (Wait for Result)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"repo_url\": \"https://github.com/pallets/flask\",\n    \"ref\": \"main\",\n    \"business_objective\": \"Evaluate Flask for enterprise use\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/analyze/sync",
+              "host": ["{{base_url}}"],
+              "path": ["analyze", "sync"]
+            },
+            "description": "Synchronous analysis - waits for completion. Use for small repos only."
+          },
+          "response": []
+        },
+        {
+          "name": "List All Jobs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/jobs",
+              "host": ["{{base_url}}"],
+              "path": ["jobs"]
+            },
+            "description": "List all analysis jobs"
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Job",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/analyze/{{job_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["analyze", "{{job_id}}"]
+            },
+            "description": "Delete an analysis job"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Examples",
+      "item": [
+        {
+          "name": "Analyze Python Project",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"repo_url\": \"https://github.com/tiangolo/fastapi\",\n    \"ref\": \"master\",\n    \"business_objective\": \"Evaluate for API modernization\",\n    \"target_platforms\": [\"Azure Container Apps\"],\n    \"compliance\": [\"SOC2\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/analyze",
+              "host": ["{{base_url}}"],
+              "path": ["analyze"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Analyze TypeScript Project",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"repo_url\": \"https://github.com/microsoft/vscode\",\n    \"ref\": \"main\",\n    \"business_objective\": \"Understand architecture for extension development\",\n    \"target_patterns\": [\"Plugin Architecture\", \"Event-Driven\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/analyze",
+              "host": ["{{base_url}}"],
+              "path": ["analyze"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Analyze Java Project",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"repo_url\": \"https://github.com/spring-projects/spring-boot\",\n    \"ref\": \"main\",\n    \"business_objective\": \"Migrate legacy Java app to Spring Boot\",\n    \"target_platforms\": [\"Azure AKS\", \"Azure Spring Apps\"],\n    \"compliance\": [\"PCI-DSS\", \"HIPAA\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/analyze",
+              "host": ["{{base_url}}"],
+              "path": ["analyze"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Analyze .NET Project",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"repo_url\": \"https://github.com/dotnet/aspnetcore\",\n    \"ref\": \"main\",\n    \"business_objective\": \"Modernize .NET Framework to .NET 8\",\n    \"target_platforms\": [\"Azure App Service\", \"Azure SQL\"],\n    \"target_patterns\": [\"Minimal APIs\", \"Blazor\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/analyze",
+              "host": ["{{base_url}}"],
+              "path": ["analyze"]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

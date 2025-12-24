@@ -31,6 +31,9 @@ pydantic-settings>=2.6.0
 # Observability (optional - for LangSmith tracing)
 langsmith>=0.1.0
 
+# Structured logging
+structlog>=24.0.0
+
 # Async utilities
 asyncio-atexit>=1.0.0
 

@@ -13,12 +13,23 @@ import re
 from datetime import datetime
 from typing import AsyncIterator
 
-from github import Github
+from github import Github, GithubException
 from github.ContentFile import ContentFile
 from github.Repository import Repository
 
 from src.config import get_settings
+from src.observability import (
+    GitHubRateLimitError,
+    InvalidRepositoryURLError,
+    RepositoryAccessDeniedError,
+    RepositoryNotFoundError,
+    get_logger,
+    metrics,
+)
 from src.schemas import DependencyInfo, FileInfo, IngestionPolicy
+
+# Initialize logger
+logger = get_logger(__name__)
 
 
 class GitHubService:
@@ -107,17 +118,47 @@ class GitHubService:
             (re.compile(pattern), replacement)
             for pattern, replacement in self.SECRET_PATTERNS
         ]
+        logger.info("github_service_initialized")
     
     def get_repository(self, repo_url: str) -> Repository:
         """Get repository object from URL."""
+        logger.debug("getting_repository", repo_url=repo_url)
+        
         # Extract owner/repo from URL
         # Supports: https://github.com/owner/repo, git@github.com:owner/repo.git
-        if "github.com" in repo_url:
-            parts = repo_url.rstrip("/").rstrip(".git").split("github.com")[-1]
-            parts = parts.lstrip("/:").split("/")
-            owner, repo = parts[0], parts[1]
-            return self.github.get_repo(f"{owner}/{repo}")
-        raise ValueError(f"Invalid GitHub URL: {repo_url}")
+        try:
+            if "github.com" in repo_url:
+                parts = repo_url.rstrip("/").rstrip(".git").split("github.com")[-1]
+                parts = parts.lstrip("/:").split("/")
+                if len(parts) < 2:
+                    raise InvalidRepositoryURLError(repo_url)
+                owner, repo = parts[0], parts[1]
+                
+                try:
+                    repository = self.github.get_repo(f"{owner}/{repo}")
+                    logger.info("repository_accessed", full_name=repository.full_name)
+                    metrics.increment("github_repos_accessed")
+                    return repository
+                except GithubException as e:
+                    if e.status == 404:
+                        logger.error("repository_not_found", repo_url=repo_url)
+                        raise RepositoryNotFoundError(repo_url)
+                    elif e.status == 403:
+                        if "rate limit" in str(e).lower():
+                            logger.error("rate_limit_exceeded")
+                            raise GitHubRateLimitError()
+                        logger.error("access_denied", repo_url=repo_url)
+                        raise RepositoryAccessDeniedError(repo_url)
+                    else:
+                        raise
+            else:
+                raise InvalidRepositoryURLError(repo_url)
+        except (InvalidRepositoryURLError, RepositoryNotFoundError, 
+                RepositoryAccessDeniedError, GitHubRateLimitError):
+            raise
+        except Exception as e:
+            logger.error("unexpected_github_error", error=str(e))
+            raise
     
     def classify_file(self, path: str) -> str | None:
         """Classify a file based on its path/name."""
@@ -175,11 +216,21 @@ class GitHubService:
         
         try:
             contents = repo.get_contents(path, ref=ref)
-        except Exception:
+        except GithubException as e:
+            if e.status == 404:
+                logger.warning("path_not_found", path=path, ref=ref)
+            else:
+                logger.error("list_files_error", path=path, error=str(e))
+            return
+        except Exception as e:
+            logger.error("list_files_unexpected_error", error=str(e))
             return
         
         if not isinstance(contents, list):
             contents = [contents]
+        
+        files_yielded = 0
+        files_skipped = 0
         
         for content in contents:
             if content.type == "dir":
@@ -188,15 +239,19 @@ class GitHubService:
             else:
                 # Check exclusions
                 if self.should_exclude(content.path, policy):
+                    files_skipped += 1
                     continue
                 
                 # Check file size
                 if content.size > policy.max_file_mb * 1024 * 1024:
+                    logger.debug("file_too_large", path=content.path, size=content.size)
+                    files_skipped += 1
                     continue
                 
                 # Skip test files if configured
                 classification = self.classify_file(content.path)
                 if classification == "tests" and not policy.include_tests:
+                    files_skipped += 1
                     continue
                 
                 yield FileInfo(
@@ -206,6 +261,10 @@ class GitHubService:
                     classification=classification,
                     checksum=content.sha,
                 )
+                files_yielded += 1
+        
+        if path == "":  # Only log at root level
+            logger.debug("files_listed", yielded=files_yielded, skipped=files_skipped)
     
     def get_file_content(
         self,
@@ -248,6 +307,8 @@ class GitHubService:
             List of discovered dependencies
         """
         dependencies = []
+        files_checked = 0
+        files_found = 0
         
         for pkg_manager, patterns in self.DEPENDENCY_FILES.items():
             for pattern in patterns:
@@ -256,16 +317,34 @@ class GitHubService:
                     if "*" in pattern:
                         continue  # Skip globs for now, would need directory listing
                     
+                    files_checked += 1
                     content_file = repo.get_contents(pattern, ref=ref)
                     if isinstance(content_file, list):
                         continue
                     
+                    files_found += 1
                     content = base64.b64decode(content_file.content).decode("utf-8")
                     deps = self._parse_dependencies(content, pkg_manager, pattern)
                     dependencies.extend(deps)
+                    logger.debug(
+                        "dependencies_parsed",
+                        file=pattern,
+                        pkg_manager=pkg_manager,
+                        count=len(deps),
+                    )
                     
-                except Exception:
+                except GithubException:
                     continue  # File doesn't exist
+                except Exception as e:
+                    logger.warning("dependency_parse_error", file=pattern, error=str(e))
+                    continue
+        
+        logger.info(
+            "dependency_discovery_complete",
+            files_checked=files_checked,
+            files_found=files_found,
+            total_dependencies=len(dependencies),
+        )
         
         return dependencies
     

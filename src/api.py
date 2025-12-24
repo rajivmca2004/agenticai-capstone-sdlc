@@ -3,20 +3,34 @@
 REST API for Code Comprehension Agents
 
 Provides HTTP endpoints to trigger the LangGraph workflow.
+Includes production-grade logging, error handling, and observability.
 """
 
 import asyncio
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.graph import create_comprehension_graph, stream_comprehension_workflow
+from src.observability import (
+    CodeComprehensionError,
+    JobNotFoundError,
+    LogContext,
+    PerformanceTracker,
+    get_correlation_id,
+    get_logger,
+    metrics,
+    new_correlation_id,
+    set_correlation_id,
+)
 from src.schemas import (
     AgentState,
     BusinessContext,
@@ -24,6 +38,9 @@ from src.schemas import (
     IngestionStatus,
     TargetArchitecture,
 )
+
+# Initialize logger
+logger = get_logger(__name__)
 
 
 # =============================================================================
@@ -84,11 +101,72 @@ class HealthResponse(BaseModel):
     agents: list[str]
 
 
+class ErrorResponse(BaseModel):
+    """Standard error response."""
+    error: str
+    message: str
+    correlation_id: str
+    details: dict[str, Any] | None = None
+
+
 # =============================================================================
 # JOB STORAGE (In-memory for POC)
 # =============================================================================
 
 jobs: dict[str, dict[str, Any]] = {}
+
+
+# =============================================================================
+# EXCEPTION HANDLERS
+# =============================================================================
+
+async def code_comprehension_exception_handler(
+    request: Request, exc: CodeComprehensionError
+) -> JSONResponse:
+    """Handle domain-specific exceptions."""
+    correlation_id = get_correlation_id()
+    logger.error(
+        "domain_error",
+        error_code=exc.error_code,
+        message=exc.message,
+        details=exc.details,
+        path=str(request.url.path),
+    )
+    metrics.increment("api_errors", tags={"error_code": exc.error_code})
+    
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": exc.error_code,
+            "message": exc.message,
+            "correlation_id": correlation_id,
+            "details": exc.details,
+        },
+    )
+
+
+async def generic_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Handle unexpected exceptions."""
+    correlation_id = get_correlation_id()
+    logger.exception(
+        "unhandled_error",
+        error_type=type(exc).__name__,
+        error_message=str(exc),
+        path=str(request.url.path),
+    )
+    metrics.increment("api_errors", tags={"error_code": "INTERNAL_ERROR"})
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "INTERNAL_ERROR",
+            "message": "An unexpected error occurred",
+            "correlation_id": correlation_id,
+            "details": {"error_type": type(exc).__name__},
+        },
+    )
 
 
 # =============================================================================
@@ -99,10 +177,10 @@ jobs: dict[str, dict[str, Any]] = {}
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     # Startup
-    print("🚀 Starting Code Comprehension API")
+    logger.info("api_starting", version="0.2.0", agents=["code_ingestion", "architect"])
     yield
     # Shutdown
-    print("👋 Shutting down Code Comprehension API")
+    logger.info("api_shutdown")
 
 
 app = FastAPI(
@@ -111,6 +189,10 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+# Register exception handlers
+app.add_exception_handler(CodeComprehensionError, code_comprehension_exception_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
 
 # CORS middleware
 app.add_middleware(
@@ -123,101 +205,177 @@ app.add_middleware(
 
 
 # =============================================================================
+# REQUEST MIDDLEWARE
+# =============================================================================
+
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    """Add correlation ID to all requests."""
+    # Get or generate correlation ID
+    correlation_id = request.headers.get("X-Correlation-ID", "")
+    if correlation_id:
+        set_correlation_id(correlation_id)
+    else:
+        correlation_id = new_correlation_id()
+    
+    # Track request timing
+    start_time = time.perf_counter()
+    
+    # Log request
+    logger.info(
+        "request_started",
+        method=request.method,
+        path=str(request.url.path),
+        query=str(request.url.query) if request.url.query else None,
+    )
+    
+    # Process request
+    response = await call_next(request)
+    
+    # Calculate duration
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    
+    # Log response
+    logger.info(
+        "request_completed",
+        method=request.method,
+        path=str(request.url.path),
+        status_code=response.status_code,
+        duration_ms=round(duration_ms, 2),
+    )
+    
+    # Track metrics
+    metrics.increment("api_requests", tags={
+        "method": request.method,
+        "path": str(request.url.path),
+        "status": str(response.status_code),
+    })
+    metrics.histogram("api_request_duration_ms", duration_ms, tags={
+        "path": str(request.url.path),
+    })
+    
+    # Add correlation ID to response
+    response.headers["X-Correlation-ID"] = correlation_id
+    
+    return response
+
+
+# =============================================================================
 # BACKGROUND TASK
 # =============================================================================
 
 async def run_comprehension_job(job_id: str, request: ComprehensionRequest):
     """Run comprehension workflow as background task."""
-    jobs[job_id]["status"] = JobStatus.RUNNING
-    jobs[job_id]["progress"] = {"current_agent": None, "messages": []}
+    # Set correlation ID for this job
+    set_correlation_id(job_id)
     
-    try:
-        # Build initial state
-        business_context = None
-        if request.business_objective:
-            business_context = BusinessContext(
-                objective=request.business_objective,
-                constraints=request.constraints,
-                kpis=request.kpis,
-                compliance_requirements=request.compliance,
-            )
+    with LogContext(job_id=job_id, repo_url=request.repo_url):
+        logger.info("job_started", request=request.model_dump())
         
-        target_arch = None
-        if request.target_platforms:
-            target_arch = TargetArchitecture(
-                platforms=request.target_platforms,
-                patterns=request.target_patterns,
-            )
+        jobs[job_id]["status"] = JobStatus.RUNNING
+        jobs[job_id]["progress"] = {"current_agent": None, "messages": []}
         
-        initial_state = AgentState(
-            repo_url=request.repo_url,
-            ref=request.ref,
-            business_context=business_context,
-            target_architecture=target_arch,
-            ingestion_policy=IngestionPolicy(
-                include_tests=request.include_tests,
-                max_file_mb=request.max_file_mb,
-            ),
-        )
-        
-        # Run graph
-        graph = create_comprehension_graph()
-        config = {"configurable": {"thread_id": job_id}}
-        
-        final_state = None
-        async for event in graph.astream(initial_state, config):
-            for node_name, state_update in event.items():
-                jobs[job_id]["progress"]["current_agent"] = node_name
-                if "messages" in state_update:
-                    for msg in state_update.get("messages", []):
-                        if hasattr(msg, "content"):
-                            jobs[job_id]["progress"]["messages"].append({
-                                "agent": node_name,
-                                "content": msg.content[:500],
-                            })
-                final_state = state_update
-        
-        # Extract results
-        result = {}
-        if final_state:
-            if hasattr(final_state, "repo_bundle") and final_state.repo_bundle:
-                bundle = final_state.repo_bundle
-                result["repo_bundle"] = {
-                    "repo_url": bundle.repo_url,
-                    "ref": bundle.ref,
-                    "languages": bundle.languages,
-                    "frameworks": bundle.frameworks,
-                    "total_files": bundle.total_files,
-                    "dependencies_count": len(bundle.dependencies),
-                    "risks_count": len(bundle.risks),
-                }
+        with PerformanceTracker("comprehension_workflow", logger) as tracker:
+            tracker.add_metadata(repo_url=request.repo_url, ref=request.ref)
             
-            if hasattr(final_state, "business_report") and final_state.business_report:
-                report = final_state.business_report
-                result["business_report"] = {
-                    "executive_summary": report.executive_summary,
-                    "options_count": len(report.options),
-                    "diagram": report.diagram_mermaid,
-                }
-            
-            if hasattr(final_state, "technical_report") and final_state.technical_report:
-                report = final_state.technical_report
-                result["technical_report"] = {
-                    "codebase_map": report.codebase_map[:500] if report.codebase_map else None,
-                    "risks_count": len(report.risk_register),
-                    "migration_waves": len(report.migration_plan),
-                    "backlog_items": len(report.backlog_slice),
-                    "diagram": report.architecture_diagram_mermaid,
-                }
-        
-        jobs[job_id]["status"] = JobStatus.COMPLETED
-        jobs[job_id]["result"] = result
-        jobs[job_id]["completed_at"] = datetime.utcnow()
-        
-    except Exception as e:
-        jobs[job_id]["status"] = JobStatus.FAILED
-        jobs[job_id]["error"] = str(e)
-        jobs[job_id]["completed_at"] = datetime.utcnow()
+            try:
+                # Build initial state
+                business_context = None
+                if request.business_objective:
+                    business_context = BusinessContext(
+                        objective=request.business_objective,
+                        constraints=request.constraints,
+                        kpis=request.kpis,
+                        compliance_requirements=request.compliance,
+                    )
+                
+                target_arch = None
+                if request.target_platforms:
+                    target_arch = TargetArchitecture(
+                        platforms=request.target_platforms,
+                        patterns=request.target_patterns,
+                    )
+                
+                initial_state = AgentState(
+                    repo_url=request.repo_url,
+                    ref=request.ref,
+                    business_context=business_context,
+                    target_architecture=target_arch,
+                    ingestion_policy=IngestionPolicy(
+                        include_tests=request.include_tests,
+                        max_file_mb=request.max_file_mb,
+                    ),
+                )
+                
+                # Run graph
+                graph = create_comprehension_graph()
+                config = {"configurable": {"thread_id": job_id}}
+                
+                final_state = None
+                async for event in graph.astream(initial_state, config):
+                    for node_name, state_update in event.items():
+                        jobs[job_id]["progress"]["current_agent"] = node_name
+                        logger.info("agent_progress", agent=node_name)
+                        
+                        if "messages" in state_update:
+                            for msg in state_update.get("messages", []):
+                                if hasattr(msg, "content"):
+                                    jobs[job_id]["progress"]["messages"].append({
+                                        "agent": node_name,
+                                        "content": msg.content[:500],
+                                    })
+                        final_state = state_update
+                
+                # Extract results
+                result = {}
+                if final_state:
+                    if hasattr(final_state, "repo_bundle") and final_state.repo_bundle:
+                        bundle = final_state.repo_bundle
+                        result["repo_bundle"] = {
+                            "repo_url": bundle.repo_url,
+                            "ref": bundle.ref,
+                            "languages": bundle.languages,
+                            "frameworks": bundle.frameworks,
+                            "total_files": bundle.total_files,
+                            "dependencies_count": len(bundle.dependencies),
+                            "risks_count": len(bundle.risks),
+                        }
+                        tracker.add_metadata(
+                            files_processed=bundle.total_files,
+                            risks_found=len(bundle.risks),
+                        )
+                    
+                    if hasattr(final_state, "business_report") and final_state.business_report:
+                        report = final_state.business_report
+                        result["business_report"] = {
+                            "executive_summary": report.executive_summary,
+                            "options_count": len(report.options),
+                            "diagram": report.diagram_mermaid,
+                        }
+                    
+                    if hasattr(final_state, "technical_report") and final_state.technical_report:
+                        report = final_state.technical_report
+                        result["technical_report"] = {
+                            "codebase_map": report.codebase_map[:500] if report.codebase_map else None,
+                            "risks_count": len(report.risk_register),
+                            "migration_waves": len(report.migration_plan),
+                            "backlog_items": len(report.backlog_slice),
+                            "diagram": report.architecture_diagram_mermaid,
+                        }
+                
+                jobs[job_id]["status"] = JobStatus.COMPLETED
+                jobs[job_id]["result"] = result
+                jobs[job_id]["completed_at"] = datetime.utcnow()
+                
+                logger.info("job_completed", result_summary=list(result.keys()))
+                metrics.increment("jobs_completed", tags={"status": "success"})
+                
+            except Exception as e:
+                logger.exception("job_failed", error=str(e))
+                jobs[job_id]["status"] = JobStatus.FAILED
+                jobs[job_id]["error"] = str(e)
+                jobs[job_id]["completed_at"] = datetime.utcnow()
+                metrics.increment("jobs_completed", tags={"status": "failed"})
 
 
 # =============================================================================
@@ -232,6 +390,12 @@ async def health_check():
         version="0.2.0",
         agents=["code_ingestion", "architect"],
     )
+
+
+@app.get("/metrics", tags=["Health"])
+async def get_metrics():
+    """Get application metrics."""
+    return metrics.get_metrics()
 
 
 @app.post("/analyze", response_model=JobResponse, tags=["Analysis"])
@@ -250,6 +414,13 @@ async def start_analysis(
     """
     job_id = str(uuid.uuid4())
     
+    logger.info(
+        "analysis_requested",
+        repo_url=request.repo_url,
+        ref=request.ref,
+        include_tests=request.include_tests,
+    )
+    
     jobs[job_id] = {
         "status": JobStatus.PENDING,
         "request": request.model_dump(),
@@ -258,10 +429,13 @@ async def start_analysis(
         "progress": None,
         "result": None,
         "error": None,
+        "correlation_id": get_correlation_id(),
     }
     
     # Run in background
     background_tasks.add_task(run_comprehension_job, job_id, request)
+    
+    metrics.increment("jobs_created")
     
     return JobResponse(
         job_id=job_id,
@@ -275,6 +449,7 @@ async def start_analysis(
 async def get_analysis_status(job_id: str):
     """Get the status of an analysis job."""
     if job_id not in jobs:
+        logger.warning("job_not_found", job_id=job_id)
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[job_id]
@@ -292,6 +467,7 @@ async def get_analysis_status(job_id: str):
 @app.get("/jobs", tags=["Analysis"])
 async def list_jobs():
     """List all analysis jobs."""
+    logger.debug("listing_jobs", count=len(jobs))
     return [
         {
             "job_id": job_id,
@@ -307,9 +483,11 @@ async def list_jobs():
 async def delete_job(job_id: str):
     """Delete an analysis job."""
     if job_id not in jobs:
+        logger.warning("job_not_found", job_id=job_id)
         raise HTTPException(status_code=404, detail="Job not found")
     
     del jobs[job_id]
+    logger.info("job_deleted", job_id=job_id)
     return {"message": f"Job {job_id} deleted"}
 
 
@@ -327,10 +505,17 @@ async def analyze_sync(request: ComprehensionRequest):
     """
     job_id = str(uuid.uuid4())
     
+    logger.info(
+        "sync_analysis_requested",
+        repo_url=request.repo_url,
+        ref=request.ref,
+    )
+    
     jobs[job_id] = {
         "status": JobStatus.RUNNING,
         "request": request.model_dump(),
         "created_at": datetime.utcnow(),
+        "correlation_id": get_correlation_id(),
     }
     
     # Run synchronously
@@ -338,6 +523,7 @@ async def analyze_sync(request: ComprehensionRequest):
     
     job = jobs[job_id]
     if job["status"] == JobStatus.FAILED:
+        logger.error("sync_analysis_failed", job_id=job_id, error=job.get("error"))
         raise HTTPException(status_code=500, detail=job.get("error", "Unknown error"))
     
     return {

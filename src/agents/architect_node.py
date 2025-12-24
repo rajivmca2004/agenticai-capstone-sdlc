@@ -16,6 +16,17 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.llm import get_architect_llm
+from src.observability import (
+    ArchitectError,
+    LLMError,
+    LogContext,
+    MissingRepoBundleError,
+    PerformanceTracker,
+    ReportGenerationError,
+    get_logger,
+    metrics,
+    track_performance,
+)
 from src.schemas import (
     AgentState,
     BacklogItem,
@@ -27,6 +38,9 @@ from src.schemas import (
     RiskSeverity,
     TechnicalReport,
 )
+
+# Initialize logger
+logger = get_logger(__name__)
 
 
 # =============================================================================
@@ -286,6 +300,7 @@ Return your response as JSON:
 # AGENT NODE
 # =============================================================================
 
+@track_performance("architect_analysis")
 async def architect_node(state: AgentState) -> dict:
     """
     LangGraph node for Architect Agent.
@@ -301,204 +316,259 @@ async def architect_node(state: AgentState) -> dict:
     Returns:
         State updates with business_report and technical_report
     """
-    llm = get_architect_llm()
-    messages = list(state.messages)
-    messages.append(SystemMessage(content=ARCHITECT_SYSTEM_PROMPT))
+    repo_url = state.repo_bundle.repo_url if state.repo_bundle else "unknown"
     
-    try:
-        # Validate we have a repo bundle
-        if not state.repo_bundle:
-            return {
-                "error": "No repo_bundle available. Run Code Ingestion Agent first.",
-                "messages": messages + [AIMessage(content="Error: No repository data available")],
-            }
+    with LogContext(agent="architect", repo_url=repo_url):
+        logger.info("architect_started")
         
-        bundle = state.repo_bundle
-        messages.append(HumanMessage(
-            content=f"Generating comprehension reports for: {bundle.repo_url}"
-        ))
+        llm = get_architect_llm()
+        messages = list(state.messages)
+        messages.append(SystemMessage(content=ARCHITECT_SYSTEM_PROMPT))
         
-        # Prepare context
-        business_ctx = state.business_context or {}
-        target_arch = state.target_architecture or {}
-        
-        # Risk summary for business report
-        risk_summary = "\n".join([
-            f"- [{r.severity.value.upper()}] {r.title}: {r.description[:100]}..."
-            for r in bundle.risks[:10]
-        ]) or "No critical risks identified"
-        
-        # Detailed risks for technical report
-        risk_details = "\n".join([
-            f"- **{r.id}** [{r.severity.value}] ({r.category}): {r.title}\n  {r.description}\n  Remediation: {r.remediation or 'TBD'}"
-            for r in bundle.risks
-        ]) or "No risks identified during ingestion"
-        
-        # Dependency list
-        dependency_list = "\n".join([
-            f"- {d.name} ({d.package_manager}): {d.version or 'unknown'}"
-            for d in bundle.dependencies[:30]
-        ]) or "No dependencies discovered"
-        
-        # Generate Business Report
-        business_prompt = BUSINESS_REPORT_PROMPT.format(
-            repo_url=bundle.repo_url,
-            ref=bundle.ref,
-            languages=", ".join(bundle.languages) or "Unknown",
-            frameworks=", ".join(bundle.frameworks) or "None detected",
-            build_systems=", ".join(bundle.build_systems) or "Unknown",
-            total_files=bundle.total_files,
-            dep_count=len(bundle.dependencies),
-            risk_count=len(bundle.risks),
-            risk_summary=risk_summary,
-            objective=getattr(business_ctx, 'objective', 'Modernize application'),
-            constraints=", ".join(getattr(business_ctx, 'constraints', [])) or "None specified",
-            kpis=", ".join(getattr(business_ctx, 'kpis', [])) or "Improve reliability",
-            compliance=", ".join(getattr(business_ctx, 'compliance_requirements', [])) or "Standard",
-            platforms=", ".join(getattr(target_arch, 'platforms', [])) or "Cloud-native",
-            patterns=", ".join(getattr(target_arch, 'patterns', [])) or "Microservices",
-        )
-        
-        business_response = await llm.ainvoke([HumanMessage(content=str(business_prompt))])
-        
-        # Parse business report
         try:
-            biz_text = business_response.content
-            biz_json_start = biz_text.find("{")
-            biz_json_end = biz_text.rfind("}") + 1
-            if biz_json_start >= 0 and biz_json_end > biz_json_start:
-                biz_data = json.loads(biz_text[biz_json_start:biz_json_end])
-            else:
+            # Validate we have a repo bundle
+            if not state.repo_bundle:
+                logger.error("missing_repo_bundle")
+                metrics.increment("architect_errors", tags={"type": "missing_bundle"})
+                raise MissingRepoBundleError()
+            
+            bundle = state.repo_bundle
+            messages.append(HumanMessage(
+                content=f"Generating comprehension reports for: {bundle.repo_url}"
+            ))
+            
+            logger.info(
+                "analyzing_bundle",
+                files=bundle.total_files,
+                languages=bundle.languages[:5],
+                risks=len(bundle.risks),
+            )
+            
+            # Prepare context
+            business_ctx = state.business_context or {}
+            target_arch = state.target_architecture or {}
+            
+            # Risk summary for business report
+            risk_summary = "\n".join([
+                f"- [{r.severity.value.upper()}] {r.title}: {r.description[:100]}..."
+                for r in bundle.risks[:10]
+            ]) or "No critical risks identified"
+            
+            # Detailed risks for technical report
+            risk_details = "\n".join([
+                f"- **{r.id}** [{r.severity.value}] ({r.category}): {r.title}\n  {r.description}\n  Remediation: {r.remediation or 'TBD'}"
+                for r in bundle.risks
+            ]) or "No risks identified during ingestion"
+            
+            # Dependency list
+            dependency_list = "\n".join([
+                f"- {d.name} ({d.package_manager}): {d.version or 'unknown'}"
+                for d in bundle.dependencies[:30]
+            ]) or "No dependencies discovered"
+            
+            # Generate Business Report
+            logger.info("generating_business_report")
+            with PerformanceTracker("business_report_generation", logger):
+                business_prompt = BUSINESS_REPORT_PROMPT.format(
+                    repo_url=bundle.repo_url,
+                    ref=bundle.ref,
+                    languages=", ".join(bundle.languages) or "Unknown",
+                    frameworks=", ".join(bundle.frameworks) or "None detected",
+                    build_systems=", ".join(bundle.build_systems) or "Unknown",
+                    total_files=bundle.total_files,
+                    dep_count=len(bundle.dependencies),
+                    risk_count=len(bundle.risks),
+                    risk_summary=risk_summary,
+                    objective=getattr(business_ctx, 'objective', 'Modernize application'),
+                    constraints=", ".join(getattr(business_ctx, 'constraints', [])) or "None specified",
+                    kpis=", ".join(getattr(business_ctx, 'kpis', [])) or "Improve reliability",
+                    compliance=", ".join(getattr(business_ctx, 'compliance_requirements', [])) or "Standard",
+                    platforms=", ".join(getattr(target_arch, 'platforms', [])) or "Cloud-native",
+                    patterns=", ".join(getattr(target_arch, 'patterns', [])) or "Microservices",
+                )
+                
+                try:
+                    business_response = await llm.ainvoke([HumanMessage(content=str(business_prompt))])
+                except Exception as e:
+                    logger.error("llm_error_business", error=str(e))
+                    metrics.increment("architect_errors", tags={"type": "llm_business"})
+                    raise LLMError(f"Failed to generate business report: {e}", cause=e)
+            
+            # Parse business report
+            try:
+                biz_text = business_response.content
+                biz_json_start = biz_text.find("{")
+                biz_json_end = biz_text.rfind("}") + 1
+                if biz_json_start >= 0 and biz_json_end > biz_json_start:
+                    biz_data = json.loads(biz_text[biz_json_start:biz_json_end])
+                else:
+                    logger.warning("business_report_no_json")
+                    biz_data = {}
+            except json.JSONDecodeError as e:
+                logger.warning("business_report_parse_error", error=str(e))
                 biz_data = {}
-        except json.JSONDecodeError:
-            biz_data = {}
-        
-        business_report = BusinessReport(
-            executive_summary=biz_data.get("executive_summary", "Report generation incomplete"),
-            current_state=biz_data.get("current_state", ""),
-            options=[
-                OptionItem(
-                    id=opt.get("id", f"OPT-{i}"),
-                    name=opt.get("name", f"Option {i}"),
-                    description=opt.get("description", ""),
-                    pros=opt.get("pros", []),
-                    cons=opt.get("cons", []),
-                    effort=EffortBand(opt.get("effort", "M")),
-                    risk_level=RiskSeverity(opt.get("risk_level", "medium")),
-                    recommended=opt.get("recommended", False),
+            
+            business_report = BusinessReport(
+                executive_summary=biz_data.get("executive_summary", "Report generation incomplete"),
+                current_state=biz_data.get("current_state", ""),
+                options=[
+                    OptionItem(
+                        id=opt.get("id", f"OPT-{i}"),
+                        name=opt.get("name", f"Option {i}"),
+                        description=opt.get("description", ""),
+                        pros=opt.get("pros", []),
+                        cons=opt.get("cons", []),
+                        effort=EffortBand(opt.get("effort", "M")),
+                        risk_level=RiskSeverity(opt.get("risk_level", "medium")),
+                        recommended=opt.get("recommended", False),
+                    )
+                    for i, opt in enumerate(biz_data.get("options", []))
+                ],
+                value_and_kpis=biz_data.get("value_and_kpis", ""),
+                adoption_plan=biz_data.get("adoption_plan", ""),
+                diagram_mermaid=biz_data.get("diagram_mermaid"),
+            )
+            
+            logger.info("business_report_generated", options_count=len(business_report.options))
+            
+            # Generate Technical Report
+            logger.info("generating_technical_report")
+            with PerformanceTracker("technical_report_generation", logger):
+                tech_prompt = TECHNICAL_REPORT_PROMPT.format(
+                    repo_url=bundle.repo_url,
+                    ref=bundle.ref,
+                    languages=", ".join(bundle.languages) or "Unknown",
+                    frameworks=", ".join(bundle.frameworks) or "None detected",
+                    build_systems=", ".join(bundle.build_systems) or "Unknown",
+                    code_file_count=len(bundle.code_files),
+                    config_file_count=len(bundle.config_files),
+                    iac_file_count=len(bundle.iac_files),
+                    cicd_file_count=len(bundle.cicd_files),
+                    test_file_count=len(bundle.test_files),
+                    doc_file_count=len(bundle.doc_files),
+                    dep_count=len(bundle.dependencies),
+                    dependency_list=dependency_list,
+                    risk_count=len(bundle.risks),
+                    risk_details=risk_details,
+                    platforms=", ".join(getattr(target_arch, 'platforms', [])) or "Cloud-native",
+                    patterns=", ".join(getattr(target_arch, 'patterns', [])) or "Microservices",
                 )
-                for i, opt in enumerate(biz_data.get("options", []))
-            ],
-            value_and_kpis=biz_data.get("value_and_kpis", ""),
-            adoption_plan=biz_data.get("adoption_plan", ""),
-            diagram_mermaid=biz_data.get("diagram_mermaid"),
-        )
-        
-        # Generate Technical Report
-        tech_prompt = TECHNICAL_REPORT_PROMPT.format(
-            repo_url=bundle.repo_url,
-            ref=bundle.ref,
-            languages=", ".join(bundle.languages) or "Unknown",
-            frameworks=", ".join(bundle.frameworks) or "None detected",
-            build_systems=", ".join(bundle.build_systems) or "Unknown",
-            code_file_count=len(bundle.code_files),
-            config_file_count=len(bundle.config_files),
-            iac_file_count=len(bundle.iac_files),
-            cicd_file_count=len(bundle.cicd_files),
-            test_file_count=len(bundle.test_files),
-            doc_file_count=len(bundle.doc_files),
-            dep_count=len(bundle.dependencies),
-            dependency_list=dependency_list,
-            risk_count=len(bundle.risks),
-            risk_details=risk_details,
-            platforms=", ".join(getattr(target_arch, 'platforms', [])) or "Cloud-native",
-            patterns=", ".join(getattr(target_arch, 'patterns', [])) or "Microservices",
-        )
-        
-        tech_response = await llm.ainvoke([HumanMessage(content=str(tech_prompt))])
-        
-        # Parse technical report
-        try:
-            tech_text = tech_response.content
-            tech_json_start = tech_text.find("{")
-            tech_json_end = tech_text.rfind("}") + 1
-            if tech_json_start >= 0 and tech_json_end > tech_json_start:
-                tech_data = json.loads(tech_text[tech_json_start:tech_json_end])
-            else:
+                
+                try:
+                    tech_response = await llm.ainvoke([HumanMessage(content=str(tech_prompt))])
+                except Exception as e:
+                    logger.error("llm_error_technical", error=str(e))
+                    metrics.increment("architect_errors", tags={"type": "llm_technical"})
+                    raise LLMError(f"Failed to generate technical report: {e}", cause=e)
+            
+            # Parse technical report
+            try:
+                tech_text = tech_response.content
+                tech_json_start = tech_text.find("{")
+                tech_json_end = tech_text.rfind("}") + 1
+                if tech_json_start >= 0 and tech_json_end > tech_json_start:
+                    tech_data = json.loads(tech_text[tech_json_start:tech_json_end])
+                else:
+                    logger.warning("technical_report_no_json")
+                    tech_data = {}
+            except json.JSONDecodeError as e:
+                logger.warning("technical_report_parse_error", error=str(e))
                 tech_data = {}
-        except json.JSONDecodeError:
-            tech_data = {}
-        
-        technical_report = TechnicalReport(
-            codebase_map=tech_data.get("codebase_map", ""),
-            topology=tech_data.get("topology", ""),
-            security_compliance=tech_data.get("security_compliance", ""),
-            nfrs=tech_data.get("nfrs", ""),
-            risk_register=[
-                RiskItem(
-                    id=r.get("id", f"RISK-{i:03d}"),
-                    category=r.get("category", "tech_debt"),
-                    severity=RiskSeverity(r.get("severity", "medium")),
-                    title=r.get("title", ""),
-                    description=r.get("description", ""),
-                    remediation=r.get("remediation"),
-                    effort=EffortBand(r.get("effort", "M")) if r.get("effort") else None,
-                )
-                for i, r in enumerate(tech_data.get("risk_register", []))
-            ],
-            target_architecture=tech_data.get("target_architecture", ""),
-            architecture_diagram_mermaid=tech_data.get("architecture_diagram_mermaid"),
-            migration_plan=[
-                MigrationWave(
-                    wave_number=w.get("wave_number", i + 1),
-                    name=w.get("name", f"Wave {i + 1}"),
-                    duration_weeks=w.get("duration_weeks", 4),
-                    tasks=w.get("tasks", []),
-                    prerequisites=w.get("prerequisites", []),
-                    rollback_plan=w.get("rollback_plan"),
-                )
-                for i, w in enumerate(tech_data.get("migration_plan", []))
-            ],
-            backlog_slice=[
-                BacklogItem(
-                    id=b.get("id", f"STORY-{i:03d}"),
-                    title=b.get("title", ""),
-                    description=b.get("description", ""),
-                    effort=EffortBand(b.get("effort", "M")),
-                    linked_risk_id=b.get("linked_risk_id"),
-                    sprint=b.get("sprint", 1),
-                )
-                for i, b in enumerate(tech_data.get("backlog_slice", []))
-            ],
-        )
-        
-        # Success message
-        success_msg = f"""Architecture analysis complete:
+            
+            technical_report = TechnicalReport(
+                codebase_map=tech_data.get("codebase_map", ""),
+                topology=tech_data.get("topology", ""),
+                security_compliance=tech_data.get("security_compliance", ""),
+                nfrs=tech_data.get("nfrs", ""),
+                risk_register=[
+                    RiskItem(
+                        id=r.get("id", f"RISK-{i:03d}"),
+                        category=r.get("category", "tech_debt"),
+                        severity=RiskSeverity(r.get("severity", "medium")),
+                        title=r.get("title", ""),
+                        description=r.get("description", ""),
+                        remediation=r.get("remediation"),
+                        effort=EffortBand(r.get("effort", "M")) if r.get("effort") else None,
+                    )
+                    for i, r in enumerate(tech_data.get("risk_register", []))
+                ],
+                target_architecture=tech_data.get("target_architecture", ""),
+                architecture_diagram_mermaid=tech_data.get("architecture_diagram_mermaid"),
+                migration_plan=[
+                    MigrationWave(
+                        wave_number=w.get("wave_number", i + 1),
+                        name=w.get("name", f"Wave {i + 1}"),
+                        duration_weeks=w.get("duration_weeks", 4),
+                        tasks=w.get("tasks", []),
+                        prerequisites=w.get("prerequisites", []),
+                        rollback_plan=w.get("rollback_plan"),
+                    )
+                    for i, w in enumerate(tech_data.get("migration_plan", []))
+                ],
+                backlog_slice=[
+                    BacklogItem(
+                        id=b.get("id", f"STORY-{i:03d}"),
+                        title=b.get("title", ""),
+                        description=b.get("description", ""),
+                        effort=EffortBand(b.get("effort", "M")),
+                        linked_risk_id=b.get("linked_risk_id"),
+                        sprint=b.get("sprint", 1),
+                    )
+                    for i, b in enumerate(tech_data.get("backlog_slice", []))
+                ],
+            )
+            
+            logger.info(
+                "technical_report_generated",
+                migration_waves=len(technical_report.migration_plan),
+                backlog_items=len(technical_report.backlog_slice),
+                risks=len(technical_report.risk_register),
+            )
+            
+            # Success message
+            success_msg = f"""Architecture analysis complete:
 - Business Report: Generated with {len(business_report.options)} options
 - Technical Report: Generated with {len(technical_report.migration_plan)} migration waves
 - Backlog Items: {len(technical_report.backlog_slice)} stories for Sprint 1-2
 - Risk Register: {len(technical_report.risk_register)} items documented"""
-        
-        messages.append(AIMessage(content=success_msg))
-        
-        return {
-            "business_report": business_report,
-            "technical_report": technical_report,
-            "messages": messages,
-            "current_agent": "architect",
-            "completed": True,
-            "error": None,
-        }
-        
-    except Exception as e:
-        error_msg = f"Architecture analysis failed: {str(e)}"
-        messages.append(AIMessage(content=error_msg))
-        
-        return {
-            "error": error_msg,
-            "messages": messages,
-            "current_agent": "architect",
-        }
+            
+            messages.append(AIMessage(content=success_msg))
+            
+            logger.info("architect_completed")
+            metrics.increment("architect_success")
+            
+            return {
+                "business_report": business_report,
+                "technical_report": technical_report,
+                "messages": messages,
+                "current_agent": "architect",
+                "completed": True,
+                "error": None,
+            }
+            
+        except (ArchitectError, LLMError, MissingRepoBundleError) as e:
+            error_msg = f"Architecture analysis failed: {e.message}"
+            logger.error("architect_failed", error_code=e.error_code, message=e.message)
+            messages.append(AIMessage(content=error_msg))
+            metrics.increment("architect_failed")
+            
+            return {
+                "error": error_msg,
+                "messages": messages,
+                "current_agent": "architect",
+            }
+            
+        except Exception as e:
+            error_msg = f"Architecture analysis failed: {str(e)}"
+            logger.exception("architect_unexpected_error")
+            messages.append(AIMessage(content=error_msg))
+            metrics.increment("architect_failed")
+            
+            return {
+                "error": error_msg,
+                "messages": messages,
+                "current_agent": "architect",
+            }
 
 
 # =============================================================================
