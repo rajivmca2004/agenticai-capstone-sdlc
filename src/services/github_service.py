@@ -113,7 +113,13 @@ class GitHubService:
     
     def __init__(self):
         settings = get_settings()
-        self.github = Github(settings.github.github_token)
+        token = settings.github.github_token
+        # Allow unauthenticated access for public repos (rate limited)
+        if token:
+            self.github = Github(token)
+        else:
+            self.github = Github()
+            logger.warning("github_unauthenticated", message="No GitHub token configured, using unauthenticated access (rate limited)")
         self._compiled_patterns = [
             (re.compile(pattern), replacement)
             for pattern, replacement in self.SECRET_PATTERNS
